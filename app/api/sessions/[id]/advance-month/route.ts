@@ -160,6 +160,10 @@ export async function POST(
       activeEvents: allActiveAfter,
       gameState: newGameStateForPrice,
       previousSentiment: latestKPIs.market_sentiment ?? 0,
+      // Seeds the sentiment walk so the same session and month always score the
+      // same. Without this the leaderboard ranks part luck: two players who made
+      // identical decisions would land on different share prices.
+      sessionId,
     });
 
     // ── 7. Persist new KPI snapshot ───────────────────────────────────────────

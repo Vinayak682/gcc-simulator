@@ -69,6 +69,15 @@ export interface SharePriceInput {
   activeEvents: (SimActiveEvent & { sim_market_events: SimMarketEvent })[];
   gameState: SimGameState;
   previousSentiment: number; // last month's sentiment drift
+  /**
+   * Session identifier. Supply it to make the sentiment walk deterministic:
+   * the same session replaying the same month scores identically.
+   *
+   * Without it the walk falls back to `Math.random()`, which means two players
+   * who made the same decisions get different share prices — and the leaderboard
+   * is then ranking luck alongside skill. Prefer to always pass it.
+   */
+  sessionId?: string;
 }
 
 export function calculateSharePrice(input: SharePriceInput): SharePriceComponents {
@@ -79,6 +88,7 @@ export function calculateSharePrice(input: SharePriceInput): SharePriceComponent
     activeEvents,
     gameState,
     previousSentiment,
+    sessionId,
   } = input;
 
   // ── Layer 1: Fundamentals ──────────────────────────────────────────────────
@@ -102,7 +112,11 @@ export function calculateSharePrice(input: SharePriceInput): SharePriceComponent
   const eventsShockClamped = clamp(eventsShock, -0.40, 0.40);
 
   // ── Layer 3: Sentiment ─────────────────────────────────────────────────────
-  const sentimentDrift = computeSentimentDrift(previousSentiment, fundamentalsDelta);
+  const sentimentDrift = computeSentimentDrift(
+    previousSentiment,
+    fundamentalsDelta,
+    sessionId === undefined ? undefined : hashString(sessionId) + currentKPIs.month
+  );
 
   // ── Compose Final Price ────────────────────────────────────────────────────
   const rawPrice =
@@ -202,8 +216,15 @@ function computeGCCMultiplier(gameState: SimGameState): number {
   }
 
   if (gameState.summer_active) {
-    multiplier *= GCC_MULTIPLIERS.summer;
-    // Cold chain companies get extra drag in summer
+    // Applied once. This previously multiplied by the same constant twice —
+    // 0.96 * 0.96 = 0.9216 — under a comment about cold-chain companies, but with
+    // no sector check, so every company took the doubled penalty.
+    //
+    // The cold-chain effect is a *cost*, carried by
+    // `summer_cold_chain_cost_multiplier`, and it already reaches the share price
+    // through EBITDA margin -> fundamentals. Multiplying here as well would
+    // double-count it, and with the wrong sign: a cost multiplier above 1 would
+    // read as good news for the price.
     multiplier *= GCC_MULTIPLIERS.summer;
   }
 
@@ -225,9 +246,17 @@ function computeGCCMultiplier(gameState: SimGameState): number {
  * Mean-reverts toward zero when at extremes.
  * Influenced by fundamentals direction (positive momentum reinforces drift).
  */
-function computeSentimentDrift(previous: number, fundamentalsDelta: number): number {
-  // Random shock component
-  const shock = gaussianRandom(0, SENTIMENT_VOLATILITY);
+function computeSentimentDrift(
+  previous: number,
+  fundamentalsDelta: number,
+  seed?: number
+): number {
+  // Random shock component. Seeded when a session id was supplied, so a replay of
+  // the same month reproduces the same price; unseeded otherwise.
+  const shock =
+    seed === undefined
+      ? gaussianRandom(0, SENTIMENT_VOLATILITY)
+      : seededGaussian(seed, 0, SENTIMENT_VOLATILITY);
 
   // Mean-reversion pull toward zero (stronger at extremes)
   const meanReversion = -previous * 0.20;
@@ -242,15 +271,24 @@ function computeSentimentDrift(previous: number, fundamentalsDelta: number): num
 
 // ─── Event Impact Application ─────────────────────────────────────────────────
 
-/** Apply event shocks to share price data stored in DB */
+/**
+ * Apply event shocks to share price data stored in DB.
+ *
+ * `currentMonth` is required to report `turnsRemaining` truthfully. This function
+ * previously returned `expires_month - triggered_month`, which is the event's
+ * total *duration* — so an event on its last turn and one that had just fired
+ * reported the same number, and it disagreed with `calculateSharePrice`, which
+ * computes the same-named field against the current month.
+ */
 export function buildEventShockSummary(
-  activeEvents: (SimActiveEvent & { sim_market_events: SimMarketEvent })[]
+  activeEvents: (SimActiveEvent & { sim_market_events: SimMarketEvent })[],
+  currentMonth: number
 ): { totalShockPct: number; byEvent: MarketEventSnapshot[] } {
   const byEvent: MarketEventSnapshot[] = activeEvents.map((ae) => ({
     eventId: ae.event_id,
     name: ae.sim_market_events.name,
     priceImpactPct: ae.sim_market_events.price_impact_pct,
-    turnsRemaining: ae.expires_month - ae.triggered_month,
+    turnsRemaining: ae.expires_month - currentMonth,
   }));
 
   const totalShockPct = byEvent.reduce((sum, e) => sum + e.priceImpactPct, 0);
@@ -307,53 +345,104 @@ export function checkWinLoss(params: {
   }
 
   // Win conditions
-  if (gameMode === 'turnaround') {
-    if (currentPrice >= winTarget && currentKPIs.ebitda_margin >= 0.12) {
-      return {
-        won: true,
-        lost: false,
-        winReason: `Turnaround complete! Share price AED ${currentPrice.toFixed(2)} (target AED ${winTarget.toFixed(2)}) with EBITDA margin ${(currentKPIs.ebitda_margin * 100).toFixed(1)}%`,
-        lossReason: null,
-      };
-    }
-  }
-
-  if (gameMode === 'growth') {
-    if (currentPrice >= winTarget && currentKPIs.market_share_pct >= 22) {
-      return {
-        won: true,
-        lost: false,
-        winReason: `Growth target achieved! AED ${currentPrice.toFixed(2)} share price with ${currentKPIs.market_share_pct.toFixed(1)}% market share`,
-        lossReason: null,
-      };
-    }
-  }
-
-  if (gameMode === 'expansion') {
-    if (currentPrice >= winTarget && currentMonth >= totalMonths) {
-      return {
-        won: true,
-        lost: false,
-        winReason: `Expansion mandate fulfilled! Completed ${totalMonths} months at AED ${currentPrice.toFixed(2)}`,
-        lossReason: null,
-      };
-    }
-  }
-
-  // End-of-game without hitting win condition
-  if (currentMonth >= totalMonths) {
-    const didWin = currentPrice >= winTarget;
+  if (currentPrice >= winTarget && meetsModeRequirement(gameMode, currentKPIs, currentMonth, totalMonths)) {
     return {
-      won: didWin,
-      lost: !didWin,
-      winReason: didWin ? `Game complete — final price AED ${currentPrice.toFixed(2)} exceeded target` : null,
-      lossReason: !didWin
-        ? `Game over — final price AED ${currentPrice.toFixed(2)} below target AED ${winTarget.toFixed(2)}`
-        : null,
+      won: true,
+      lost: false,
+      winReason: modeWinReason(gameMode, { currentPrice, winTarget, currentKPIs, totalMonths }),
+      lossReason: null,
+    };
+  }
+
+  // End of game without having met the win condition.
+  //
+  // This must re-check the mode requirement, not just the price. It previously
+  // tested `currentPrice >= winTarget` alone, so a player who hit the price target
+  // but missed their mode's second gate — EBITDA margin in turnaround, market
+  // share in growth — was awarded the win simply for running the clock out. That
+  // made the harder half of every mode's objective optional.
+  if (currentMonth >= totalMonths) {
+    const priceMet = currentPrice >= winTarget;
+    const requirementMet = meetsModeRequirement(gameMode, currentKPIs, currentMonth, totalMonths);
+    if (priceMet && requirementMet) {
+      return {
+        won: true,
+        lost: false,
+        winReason: `Game complete — final price AED ${currentPrice.toFixed(2)} exceeded target`,
+        lossReason: null,
+      };
+    }
+    return {
+      won: false,
+      lost: true,
+      winReason: null,
+      lossReason: priceMet
+        ? `Game over — price target met at AED ${currentPrice.toFixed(2)}, but ${modeRequirementLabel(gameMode)} was not`
+        : `Game over — final price AED ${currentPrice.toFixed(2)} below target AED ${winTarget.toFixed(2)}`,
     };
   }
 
   return { won: false, lost: false, winReason: null, lossReason: null };
+}
+
+/**
+ * The second gate each mode imposes on top of the share-price target.
+ *
+ * Kept as one function so the mid-game check and the end-of-game check cannot
+ * drift apart — that divergence is exactly what let the clock run out into a win.
+ */
+function meetsModeRequirement(
+  gameMode: string,
+  currentKPIs: SimKPISnapshot,
+  currentMonth: number,
+  totalMonths: number
+): boolean {
+  switch (gameMode) {
+    case 'turnaround':
+      return currentKPIs.ebitda_margin >= 0.12;
+    case 'growth':
+      return currentKPIs.market_share_pct >= 22;
+    case 'expansion':
+      return currentMonth >= totalMonths;
+    default:
+      // An unrecognised mode imposes no extra gate beyond the price target.
+      return true;
+  }
+}
+
+function modeRequirementLabel(gameMode: string): string {
+  switch (gameMode) {
+    case 'turnaround':
+      return 'the 12% EBITDA margin requirement';
+    case 'growth':
+      return 'the 22% market share requirement';
+    case 'expansion':
+      return 'the full expansion term';
+    default:
+      return 'the mode requirement';
+  }
+}
+
+function modeWinReason(
+  gameMode: string,
+  ctx: {
+    currentPrice: number;
+    winTarget: number;
+    currentKPIs: SimKPISnapshot;
+    totalMonths: number;
+  }
+): string {
+  const { currentPrice, winTarget, currentKPIs, totalMonths } = ctx;
+  switch (gameMode) {
+    case 'turnaround':
+      return `Turnaround complete! Share price AED ${currentPrice.toFixed(2)} (target AED ${winTarget.toFixed(2)}) with EBITDA margin ${(currentKPIs.ebitda_margin * 100).toFixed(1)}%`;
+    case 'growth':
+      return `Growth target achieved! AED ${currentPrice.toFixed(2)} share price with ${currentKPIs.market_share_pct.toFixed(1)}% market share`;
+    case 'expansion':
+      return `Expansion mandate fulfilled! Completed ${totalMonths} months at AED ${currentPrice.toFixed(2)}`;
+    default:
+      return `Target reached at AED ${currentPrice.toFixed(2)}`;
+  }
 }
 
 // ─── GCC Calendar ─────────────────────────────────────────────────────────────

@@ -4,6 +4,42 @@
 
 > Step into the boardroom. Run a Dubai-listed FMCG company. Eight AI agents watch every move you make.
 
+**Problem.** Business simulators usually score you on a single number that moves for reasons you cannot inspect. That makes them unfalsifiable: you cannot tell a good decision from a lucky month, and a leaderboard built on it ranks noise alongside skill.
+
+**Approach.** The share price is a documented three-layer function — fundamentals 60%, event shocks 25%, sentiment 15% — computed from month-over-month KPI deltas with GCC seasonality applied as explicit named multipliers (Ramadan 1.08, summer 0.96, Saudization overhang 0.97). Every layer is a pure function of the prior state, and the sentiment walk is seeded from the session id, so the same session and month always produce the same price. Circuit breakers hold the price inside the DFM floor and 5x base.
+
+**Result.** 42 tests over the scoring engine, green on Node 20 and 22 with a clean `tsc --noEmit`. Reproducible scoring means the leaderboard compares decisions rather than dice.
+
+---
+
+## What the tests caught
+
+The engine was written before the tests. Writing them found four defects, all invisible while playing:
+
+**The summer drag was applied twice.** `multiplier *= GCC_MULTIPLIERS.summer` appeared twice in a row under a comment about cold-chain companies — but with no sector check, so *every* company took 0.96 x 0.96 = 0.9216 instead of 0.96. The cold-chain effect is a cost, already carried by `summer_cold_chain_cost_multiplier`, and it reaches the price through EBITDA margin; multiplying here double-counted it, with the wrong sign.
+
+**Running the clock out bypassed the win requirements.** Each mode gates its win on a second condition beyond share price — 12% EBITDA margin in turnaround, 22% market share in growth. The end-of-game branch tested price alone, so a player who hit the price target and missed the harder gate was awarded the win for simply reaching the final month. Both checks now go through one `meetsModeRequirement` function so they cannot drift apart again.
+
+**Scoring was not reproducible.** `seededRandom`, `seededGaussian`, and `hashString` were written and exported for "deterministic replays" — and never called. The sentiment walk used `Math.random()`, so two players making identical decisions got different share prices. Now seeded from session id plus month, and the API route passes it.
+
+**`buildEventShockSummary` reported the wrong number.** Its `turnsRemaining` was `expires_month - triggered_month` — the event's total duration — so an event about to expire and one that had just fired reported the same value, and it disagreed with the identically-named field from `calculateSharePrice`.
+
+Also corrected: `.env.example` documented `ANTHROPIC_API_KEY`, but `lib/simulator/claude.ts` reads `GOOGLE_AI_API_KEY`. Following the old setup produced an app whose AI endpoints silently returned fallbacks.
+
+> **Naming note.** `lib/simulator/claude.ts` calls Google Gemini (`gemini-2.0-flash` / `gemini-1.5-pro`), and `@anthropic-ai/sdk` is a declared dependency that is never imported. The filename is left as-is because renaming it touches imports across the app — but the provider is Gemini, not Claude.
+
+---
+
+## Tests
+
+```bash
+npm install
+npm test            # 42 tests, no Supabase and no AI key needed
+npm run type-check
+```
+
+The suite covers `lib/simulator/sharePrice.ts` only — deliberately, because that is the file that decides outcomes. Everything it touches is a pure function, so the tests need no database, no API key, and no browser.
+
 ---
 
 ## What This Is
